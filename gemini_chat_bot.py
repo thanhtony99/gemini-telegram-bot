@@ -6,12 +6,15 @@ from google import genai
 from google.genai import types
 
 # ==========================================
-# 1. KHAI BÁO BIẾN MÔI TRƯỜNG & HỆ THỐNG
+# 1. CẤU HÌNH BIẾN MÔI TRƯỜNG & HỆ THỐNG
 # ==========================================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 PORT = int(os.environ.get("PORT", 10000))
 WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL")
+
+# Tên mô hình chính thức của Google Gemini API
+MODEL_NAME = 'gemini-2.5-flash'
 
 # Khởi tạo Gemini Client
 client = genai.Client(api_key=GEMINI_API_KEY)
@@ -19,20 +22,20 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 # Cấu hình nhật ký hệ thống (Logging)
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# Chỉ thị hệ thống giúp AI trả lời chi tiết và chuyên nghiệp
+# Chỉ thị hệ thống (System Instruction): Ép AI đóng vai chuyên gia trả lời sâu sắc và chi tiết
 SYSTEM_INSTRUCTION = (
-    "Bạn là một trợ lý AI cao cấp, thông minh và chuyên nghiệp. "
+    "Bạn là một trợ lý AI cao cấp, thông minh, chuyên về lập trình và giải quyết vấn đề. "
     "Hãy luôn phân tích kỹ lưỡng, trả lời đầy đủ, chi tiết, chính xác "
-    "và sử dụng định dạng rõ ràng để trình bày cho người dùng."
+    "và trình bày bằng định dạng Markdown đẹp mắt, rõ ràng."
 )
 
 # ==========================================
-# 2. HÀM GỬI TIN NHẮN AN TOÀN (CHỐNG TRÔI TIN)
+# 2. HÀM GỬI TIN NHẮN AN TOÀN (SAFE REPLY)
 # ==========================================
 async def safe_reply(update: Update, text: str):
     """
-    Hàm hỗ trợ gửi tin nhắn an toàn:
-    Thử gửi bằng Markdown trước, nếu Telegram báo lỗi ký tự sẽ tự động chuyển sang Plain Text.
+    Gửi tin nhắn về Telegram an toàn.
+    Thử định dạng Markdown trước; nếu gặp lỗi ký tự đặc biệt sẽ tự động gửi dạng Plain Text.
     """
     try:
         await update.message.reply_text(text, parse_mode='Markdown')
@@ -44,76 +47,113 @@ async def safe_reply(update: Update, text: str):
             logging.error(f"Không thể gửi tin nhắn Telegram: {final_err}")
 
 # ==========================================
-# 3. HÀM XỬ LÝ TIN NHẮN CHÍNH
+# 3. HÀM XỬ LÝ LỘC CÂU HỎI & GỌI GEMINI API
 # ==========================================
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
-    logging.info(f"Nhận tin nhắn từ người dùng: {user_text}")
+async def process_gemini_request(user_text: str, enable_search: bool = False) -> str:
+    """
+    Hàm gọi Gemini API với chế độ Offline (mặc định) hoặc Online (khi dùng lệnh /search)
+    """
+    config_params = {
+        "system_instruction": SYSTEM_INSTRUCTION,
+        "temperature": 0.7,
+    }
     
-    # Hiển thị biểu tượng "đang gõ..." trên Telegram
-    try:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    except Exception as e:
-        logging.warning(f"Không thể gửi chat action: {e}")
-    
-    bot_reply = ""
+    # Chỉ đính kèm Google Search khi enable_search = True
+    if enable_search:
+        config_params["tools"] = [types.Tool(google_search=types.GoogleSearch())]
 
     try:
-        # Gọi Gemini 3.6 Flash kèm Google Search Trực tuyến cho 100% câu hỏi
         response = client.models.generate_content(
-            model='gemini-3.6-flash',
+            model=MODEL_NAME,
             contents=user_text,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                tools=[types.Tool(google_search=types.GoogleSearch())],
-                temperature=0.7,
-            )
+            config=types.GenerateContentConfig(**config_params)
         )
-        bot_reply = response.text if response.text else "Không nhận được phản hồi từ AI."
-
+        return response.text if response.text else "Không nhận được phản hồi từ AI."
+        
     except Exception as e:
-        error_message = str(e)
-        logging.error(f"Lỗi khi gọi Gemini API: {error_message}")
-
-        # Tự động xử lý khi hết Quota Google Search (Lỗi 429)
-        if "429" in error_message or "RESOURCE_EXHAUSTED" in error_message:
+        err_msg = str(e)
+        logging.error(f"Lỗi API Gemini (Search={enable_search}): {err_msg}")
+        
+        # Nếu đang bật Search mà bị lỗi 429 Quota, tự động chuyển ngay sang Chế độ Offline
+        if enable_search and ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg):
+            logging.info("Tự động chuyển sang chế độ Offline do hết Quota Search...")
             try:
-                response_fallback = client.models.generate_content(
-                    model='gemini-3.6-flash',
+                response_offline = client.models.generate_content(
+                    model=MODEL_NAME,
                     contents=user_text,
                     config=types.GenerateContentConfig(
                         system_instruction=SYSTEM_INSTRUCTION,
-                        temperature=0.7,
+                        temperature=0.7
                     )
                 )
-                bot_reply = (
-                    f"{response_fallback.text}\n\n"
-                    f"⚠️ *(Lưu ý: Tạm thời đạt giới hạn Google Search, câu trả lời dựa trên tri thức sẵn có của AI)*"
+                return (
+                    f"{response_offline.text}\n\n"
+                    f"💡 *(Lưu ý: Đã đạt hạn mức Google Search hôm nay. "
+                    f"Câu trả lời được xuất ra từ tri thức chuyên sâu sẵn có của Gemini)*"
                 )
-            except Exception as fallback_error:
-                bot_reply = "⚠️ Hệ thống đang quá tải Quota API trong phút này. Bạn vui lòng đợi 1 phút rồi gửi lại nhé!"
-        else:
-            bot_reply = f"Đã xảy ra lỗi hệ thống: {error_message}"
+            except Exception as fallback_err:
+                return f"⚠️ Lỗi hệ thống: {fallback_err}"
+        
+        return f"⚠️ Đã xảy ra lỗi: {err_msg}"
 
-    # Gửi câu trả lời an toàn về Telegram
+# ==========================================
+# 4. HANDLERS XỬ LÝ TIN NHẮN TELEGRAM
+# ==========================================
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Xử lý các tin nhắn chat thông thường (Chế độ mặc định siêu nhanh)"""
+    user_text = update.message.text
+    logging.info(f"Nhận tin nhắn thường: {user_text}")
+    
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
+    # Mặc định sử dụng Chế độ Tri thức Chuyên sâu (Phản hồi tức thì, không tốn Quota Search)
+    bot_reply = await process_gemini_request(user_text, enable_search=False)
     await safe_reply(update, bot_reply)
 
-# ==========================================
-# 4. LỆNH KHỞI ĐỘNG BOT (/start)
-# ==========================================
+async def handle_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Xử lý khi người dùng dùng lệnh /search hoặc /s để tra cứu online"""
+    user_text = " ".join(context.args) if context.args else ""
+    
+    if not user_text:
+        await safe_reply(
+            update, 
+            "🔍 **Cách dùng lệnh Search Online:**\n"
+            "Cú pháp: `/search <câu hỏi>` hoặc `/s <câu hỏi>`\n"
+            "Ví dụ: `/search thời tiết TP HCM hôm nay`"
+        )
+        return
+
+    logging.info(f"Nhận yêu cầu Search Online: {user_text}")
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
+    # Bật Google Search Trực tuyến cho riêng câu hỏi này
+    bot_reply = await process_gemini_request(user_text, enable_search=True)
+    await safe_reply(update, bot_reply)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_text = "🚀 Chào bạn! Bot AI Gemini đã sẵn sàng hỗ trợ. Hãy gửi câu hỏi cho tôi nhé!"
+    welcome_text = (
+        "🚀 **Chào bạn! Tôi là Bot AI Gemini 2.5 Flash**\n\n"
+        "• **Chat thông thường:** Hãy gửi câu hỏi trực tiếp (Viết code, sửa lỗi, giải thích mã,...). Phản hồi siêu nhanh và không bao giờ bị nghẽn Quota!\n"
+        "• **Tra cứu Google Trực tuyến:** Dùng lệnh `/search <câu hỏi>` hoặc `/s <câu hỏi>` khi cần tra tin tức hay thông tin thời gian thực.\n\n"
+        "Hãy gửi tin nhắn cho tôi ngay nhé!"
+    )
     await safe_reply(update, welcome_text)
 
 # ==========================================
-# 5. CHƯƠNG TRÌNH CHÍNH (WEBHOOK DEPLOY)
+# 5. CHƯƠNG TRÌNH CHÍNH (WEBHOOK DEPLOYMENT)
 # ==========================================
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     
+    # Đăng ký lệnh
     app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('search', handle_search_command))
+    app.add_handler(CommandHandler('s', handle_search_command))
+    
+    # Tin nhắn văn bản thông thường
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     
+    # Khởi chạy Webhook trên Render
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
