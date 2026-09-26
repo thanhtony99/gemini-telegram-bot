@@ -16,9 +16,9 @@ WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL")
 
 # Danh sách chuỗi mô hình ưu tiên cho Search Online (3.8 -> 3.7 -> 3.6 -> 3.5 Lite)
 SEARCH_CASCADE_MODELS = [
-    'gemini-3.8-flash',
-    'gemini-3.7-flash',
-    'gemini-3.6-flash',
+    # 'gemini-3.8-flash',
+    # 'gemini-3.7-flash',
+    # 'gemini-3.6-flash',
     'gemini-3.5-flash-lite'
 ]
 
