@@ -14,21 +14,24 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 PORT = int(os.environ.get("PORT", 10000))
 WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL")
 
-# Cấu hình danh sách mô hình (Mô hình chính & Mô hình dự phòng)
-PRIMARY_MODEL = 'gemini-3.8-flash'
-FALLBACK_MODEL = 'gemini-3.6-flash'
+# Danh sách chuỗi Fallback Tra cứu Online theo đúng thứ tự ưu tiên
+SEARCH_CASCADE_MODELS = [
+    'gemini-3.8-flash',
+    'gemini-3.7-flash',
+    'gemini-3.6-flash',
+    'gemini-3.5-flash-lite'
+]
 
-# Cấu hình tính năng Tự động Thử lại
-MAX_RETRIES = 3      # Số lần thử lại tối đa cho mỗi mô hình
-BASE_DELAY = 1.0     # Thời gian chờ cơ sở (giây)
+# Mô hình sử dụng cho dữ liệu nội bộ (Offline Data) khi tất cả Quota Search đã hết
+OFFLINE_FALLBACK_MODEL = 'gemini-3.8-flash'
 
 # Khởi tạo Gemini Client
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Cấu hình Logging
+# Cấu hình Nhật ký Hệ thống (Logging)
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# System Instruction
+# Chỉ thị hệ thống (System Instruction)
 SYSTEM_INSTRUCTION = (
     "Bạn là một trợ lý AI cao cấp, thông minh, chuyên về lập trình và giải quyết vấn đề. "
     "Hãy luôn phân tích kỹ lưỡng, trả lời đầy đủ, chi tiết, chính xác "
@@ -50,96 +53,104 @@ async def safe_reply(update: Update, text: str):
             logging.error(f"Không thể gửi tin nhắn Telegram: {final_err}")
 
 # ==========================================
-# 3. HÀM GỌI GEMINI API BẤT ĐỒNG BỘ (ASYNC + FALLBACK)
+# 3. HÀM THỰC HIỆN CHUỖI FALLBACK WATERFALL
 # ==========================================
-async def process_gemini_request(user_text: str, enable_search: bool = False) -> str:
+async def process_gemini_request(user_text: str, enable_search: bool = True) -> str:
     """
-    Hàm gọi Gemini API bất đồng bộ với cơ chế Fallback sang Model dự phòng
-    và Auto-Retry khi máy chủ bị quá tải (Lỗi 503/429).
+    Hàm thực hiện chuỗi Fallback linh hoạt:
+    3.8 Flash (Online) -> 3.7 Flash (Online) -> 3.6 Flash (Online) -> 3.5 Flash Lite (Online)
+    -> 3.8 Flash (Offline Data)
     """
-    models_to_try = [PRIMARY_MODEL, FALLBACK_MODEL]
-
-    for model_name in models_to_try:
-        config_params = {
-            "system_instruction": SYSTEM_INSTRUCTION,
-            "temperature": 0.7,
-        }
-        
-        if enable_search:
-            config_params["tools"] = [types.Tool(google_search=types.GoogleSearch())]
-
-        for attempt in range(1, MAX_RETRIES + 1):
+    
+    # ----------------------------------------------------
+    # BƯỚC 1: Thử lần lượt các mô hình ở Chế độ Search Online
+    # ----------------------------------------------------
+    if enable_search:
+        for model_name in SEARCH_CASCADE_MODELS:
             try:
-                # Sử dụng client.aio (Async Client) để không gây nghẽn event loop của Telegram
+                logging.info(f"Đang thử tra cứu Online với mô hình: {model_name}")
+                
+                config_search = types.GenerateContentConfig(
+                    system_instruction=SYSTEM_INSTRUCTION,
+                    temperature=0.7,
+                    tools=[types.Tool(google_search=types.GoogleSearch())]
+                )
+                
+                # Gọi API bất đồng bộ với Google Search
                 response = await client.aio.models.generate_content(
                     model=model_name,
                     contents=user_text,
-                    config=types.GenerateContentConfig(**config_params)
+                    config=config_search
                 )
                 
                 if response and response.text:
+                    logging.info(f"Thành công lấy dữ liệu Online từ model: {model_name}")
                     return response.text
-                
-            except Exception as e:
-                err_msg = str(e)
-                logging.warning(f"Thử model '{model_name}' (Lần {attempt}/{MAX_RETRIES}) gặp lỗi: {err_msg}")
-                
-                # Kiểm tra lỗi quá tải 503 hoặc hết hạn mức 429
-                is_overload = any(code in err_msg for code in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"])
-                
-                if is_overload:
-                    if attempt < MAX_RETRIES:
-                        wait_time = BASE_DELAY * (2 ** (attempt - 1)) # 1s, 2s, 4s
-                        logging.info(f"Đang chờ {wait_time}s trước khi thử lại...")
-                        await asyncio.sleep(wait_time)
-                        continue
-                    else:
-                        logging.info(f"Model '{model_name}' quá tải hoàn toàn. Tự động chuyển sang mô hình dự phòng...")
-                        break # Chuyển sang model tiếp theo trong models_to_try
-                else:
-                    # Lỗi khác (ví dụ sai cú pháp) -> Dừng ngay
-                    break
 
-    return "⌛ Máy chủ Google AI hiện đang trong đợt bảo trì/quá tải tạm thời trên toàn hệ thống. Bạn vui lòng thử lại sau ít phút nhé!"
+            except Exception as e:
+                logging.warning(f"Mô hình '{model_name}' (Online Search) gặp lỗi/hết Quota: {e}")
+                # Tiếp tục vòng lặp để nhảy sang mô hình tiếp theo trong SEARCH_CASCADE_MODELS
+                continue
+
+    # ----------------------------------------------------
+    # BƯỚC 2: Fallback về 3.8 Flash Chế độ Offline (Tri thức sẵn có)
+    # ----------------------------------------------------
+    logging.info(f"Tất cả mô hình Search Online đều hết Quota/Lỗi. Chuyển sang Offline Data với {OFFLINE_FALLBACK_MODEL}")
+    try:
+        config_offline = types.GenerateContentConfig(
+            system_instruction=SYSTEM_INSTRUCTION,
+            temperature=0.7
+        )
+        
+        response_offline = await client.aio.models.generate_content(
+            model=OFFLINE_FALLBACK_MODEL,
+            contents=user_text,
+            config=config_offline
+        )
+        
+        if response_offline and response_offline.text:
+            return (
+                f"{response_offline.text}\n\n"
+                f"💡 *(Lưu ý: Hạn mức tra cứu Google Online của tất cả các mô hình hôm nay đã hết. "
+                f"Câu trả lời được trích xuất từ tri thức sẵn có của {OFFLINE_FALLBACK_MODEL})*"
+            )
+
+    except Exception as e_offline:
+        logging.error(f"Lỗi khi gọi Offline Fallback {OFFLINE_FALLBACK_MODEL}: {e_offline}")
+        
+        # Dự phòng khẩn cấp cuối cùng: Dùng 3.5 Flash Lite Offline
+        try:
+            response_last = await client.aio.models.generate_content(
+                model='gemini-3.5-flash-lite',
+                contents=user_text,
+                config=types.GenerateContentConfig(system_instruction=SYSTEM_INSTRUCTION)
+            )
+            return response_last.text
+        except Exception as final_err:
+            logging.error(f"Lỗi khẩn cấp toàn hệ thống: {final_err}")
+
+    return "⌛ Máy chủ Google AI hiện đang quá tải toàn bộ các mô hình. Bạn vui lòng thử lại sau ít phút nhé!"
 
 # ==========================================
 # 4. HANDLERS XỬ LÝ TIN NHẮN TELEGRAM
 # ==========================================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Xử lý câu hỏi thông thường (Chế độ mặc định - Phản hồi tức thì)"""
+    """Mặc định mỗi câu hỏi gửi lên đều chạy qua chuỗi Fallback Search Online"""
     user_text = update.message.text
-    logging.info(f"Nhận tin nhắn: {user_text}")
+    logging.info(f"Nhận câu hỏi: {user_text}")
     
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     
-    bot_reply = await process_gemini_request(user_text, enable_search=False)
-    await safe_reply(update, bot_reply)
-
-async def handle_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Xử lý tra cứu online khi dùng lệnh /search hoặc /s"""
-    user_text = " ".join(context.args) if context.args else ""
-    
-    if not user_text:
-        await safe_reply(
-            update, 
-            "🔍 **Cách dùng lệnh Tra cứu Online:**\n"
-            "Cú pháp: `/search <câu hỏi>` hoặc `/s <câu hỏi>`\n"
-            "Ví dụ: `/s giá xăng hôm nay`"
-        )
-        return
-
-    logging.info(f"Nhận yêu cầu Search Online: {user_text}")
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    
+    # Kích hoạt chuỗi Fallback ưu tiên Search Online
     bot_reply = await process_gemini_request(user_text, enable_search=True)
     await safe_reply(update, bot_reply)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
-        "🚀 **Chào bạn! Tôi là Bot AI Gemini (Bản ổn định chống quá tải)**\n\n"
-        "• **Hỏi đáp lập trình:** Nhắn tin trực tiếp để trao đổi về mã code, tư vấn logic.\n"
-        "• **Tra cứu Online:** Dùng lệnh `/s <câu hỏi>` hoặc `/search <câu hỏi>`.\n\n"
-        "Hãy gửi tin nhắn cho tôi nhé!"
+        "🚀 **Chào bạn! Tôi là Bot AI Gemini (Bản Tối ưu Chuỗi Fallback)**\n\n"
+        "• Hệ thống tự động tìm kiếm kết quả tốt nhất qua chuỗi mô hình: **3.8 Flash ➔ 3.7 Flash ➔ 3.6 Flash ➔ 3.5 Flash Lite**.\n"
+        "• Nếu tất cả các mô hình hết hạn mức Search Online, hệ thống sẽ tự động dùng dữ liệu tri thức sẵn có của **Gemini 3.8 Flash**.\n\n"
+        "Hãy đặt câu hỏi cho tôi ngay nhé!"
     )
     await safe_reply(update, welcome_text)
 
@@ -151,8 +162,6 @@ if __name__ == '__main__':
     
     # Đăng ký các Handler
     app.add_handler(CommandHandler('start', start))
-    app.add_handler(CommandHandler('search', handle_search_command))
-    app.add_handler(CommandHandler('s', handle_search_command))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     
     # Khởi chạy Webhook trên Render
